@@ -34,4 +34,17 @@ public interface Shader {
      * @throws MojoExecutionException for anything else that goes wrong
      */
     void shade(ShadeRequest shadeRequest) throws IOException, MojoExecutionException;
+
+    /**
+     * Perform a dry-run of a shading operation: computes where every entry of every input JAR would end up
+     * after filters, relocations and resource transformers are applied, and which occurrence of overlapping
+     * entries would win, without writing the output JAR and without letting resource transformers mutate
+     * their state or finish into the output stream.
+     *
+     * @param shadeRequest holds the many parameters to this method
+     * @return the plan; when an entry cannot be planned the returned plan is incomplete and carries the
+     *         failure location
+     * @since 3.6.3
+     */
+    ShadePlan plan(ShadeRequest shadeRequest);
 }

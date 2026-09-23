@@ -30,6 +30,7 @@ import java.util.Set;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 
+import org.apache.maven.plugins.shade.ShadePlanEntry;
 import org.apache.maven.plugins.shade.relocation.Relocator;
 import org.codehaus.plexus.util.IOUtil;
 
@@ -50,6 +51,12 @@ public class ServicesResourceTransformer extends AbstractCompatibilityTransforme
     @Override
     public boolean canTransformResource(String resource) {
         return resource.startsWith(SERVICES_PATH);
+    }
+
+    @Override
+    public void contributeToPlan(ShadePlanEntry.Builder entry) {
+        entry.putTransformerPlanAttribute("action", "merge");
+        entry.putTransformerPlanAttribute("mergeStrategy", "concatenate-unique-lines");
     }
 
     @Override

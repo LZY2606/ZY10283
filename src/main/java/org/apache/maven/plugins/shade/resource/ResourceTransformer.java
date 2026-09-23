@@ -23,6 +23,7 @@ import java.io.InputStream;
 import java.util.List;
 import java.util.jar.JarOutputStream;
 
+import org.apache.maven.plugins.shade.ShadePlanEntry;
 import org.apache.maven.plugins.shade.relocation.Relocator;
 
 /**
@@ -45,4 +46,16 @@ public interface ResourceTransformer {
     boolean hasTransformedResource();
 
     void modifyOutputStream(JarOutputStream os) throws IOException;
+
+    /**
+     * Contributes read-only information about what this transformer would do with the given resource to a
+     * dry-run shade plan entry. Implementations must not mutate their state here: a dry-run must not pollute
+     * a subsequent real shading run using the same transformer instance.
+     *
+     * @param entry the plan entry being built for a resource this transformer can transform
+     * @since 3.6.3
+     */
+    default void contributeToPlan(ShadePlanEntry.Builder entry) {
+        // no plan contribution by default
+    }
 }

@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.Writer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -51,6 +52,7 @@ import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
+import org.apache.maven.plugins.shade.ShadePlan;
 import org.apache.maven.plugins.shade.ShadeRequest;
 import org.apache.maven.plugins.shade.Shader;
 import org.apache.maven.plugins.shade.filter.Filter;
@@ -380,6 +382,17 @@ public class ShadeMojo extends AbstractMojo {
     private File outputFile;
 
     /**
+     * When set, no shaded JAR is written. Instead a dry-run is executed and the resulting shade plan -
+     * where every entry of every input JAR would end up after filters, relocations and resource
+     * transformers, and which occurrence of overlapping entries would win - is written to the referenced
+     * file as JSON. The execution fails when the plan cannot be completed.
+     *
+     * @since 3.6.3
+     */
+    @Parameter(property = "shade.dryRunPlanFile")
+    private File dryRunPlanFile;
+
+    /**
      * You can pass here the roleHint about your own Shader implementation plexus component.
      *
      * @since 1.6
@@ -543,6 +556,13 @@ public class ShadeMojo extends AbstractMojo {
             List<Relocator> relocators = getRelocators();
 
             List<ResourceTransformer> resourceTransformers = getResourceTransformers();
+
+            if (dryRunPlanFile != null) {
+                ShadePlan plan = shader.plan(
+                        shadeRequest("jar", artifacts, outputJar, filters, relocators, resourceTransformers));
+                writeShadePlan(plan);
+                return;
+            }
 
             if (createDependencyReducedPom) {
                 createDependencyReducedPom(artifactIds);
@@ -710,6 +730,24 @@ public class ShadeMojo extends AbstractMojo {
         shadeRequest.setRelocators(relocators);
         shadeRequest.setResourceTransformers(toResourceTransformers(shade, resourceTransformers));
         return shadeRequest;
+    }
+
+    private void writeShadePlan(ShadePlan plan) throws MojoExecutionException {
+        try {
+            if (dryRunPlanFile.getParentFile() != null) {
+                Files.createDirectories(dryRunPlanFile.getParentFile().toPath());
+            }
+            Files.write(dryRunPlanFile.toPath(), plan.toJson().getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            throw new MojoExecutionException("Could not write shade plan to " + dryRunPlanFile, e);
+        }
+        if (!plan.isComplete()) {
+            throw new MojoExecutionException("Shade plan is incomplete: failed at "
+                    + plan.getFailureJar()
+                    + (plan.getFailureEntry() != null ? " entry " + plan.getFailureEntry() : "")
+                    + ": " + plan.getFailureMessage());
+        }
+        getLog().info("Wrote dry-run shade plan to " + dryRunPlanFile);
     }
 
     private ShadeRequest createShadeSourcesRequest(

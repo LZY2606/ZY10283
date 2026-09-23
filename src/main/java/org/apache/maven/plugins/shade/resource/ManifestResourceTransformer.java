@@ -29,6 +29,7 @@ import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
 
+import org.apache.maven.plugins.shade.ShadePlanEntry;
 import org.apache.maven.plugins.shade.relocation.Relocator;
 
 /**
@@ -74,6 +75,11 @@ public class ManifestResourceTransformer extends AbstractCompatibilityTransforme
     @Override
     public boolean canTransformResource(String resource) {
         return JarFile.MANIFEST_NAME.equalsIgnoreCase(resource);
+    }
+
+    @Override
+    public void contributeToPlan(ShadePlanEntry.Builder entry) {
+        entry.putTransformerPlanAttribute("action", "merge-manifest");
     }
 
     @Override

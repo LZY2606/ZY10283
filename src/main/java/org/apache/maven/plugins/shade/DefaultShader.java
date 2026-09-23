@@ -45,6 +45,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -187,6 +188,416 @@ public class DefaultShader implements Shader {
         for (Filter filter : shadeRequest.getFilters()) {
             filter.finished();
         }
+    }
+
+    @Override
+    public ShadePlan plan(ShadeRequest shadeRequest) {
+        ShadePlan.Builder plan = ShadePlan.builder();
+        List<File> jars = new ArrayList<>(shadeRequest.getJars());
+        for (File jar : jars) {
+            plan.addJar(jar.getPath());
+        }
+
+        List<ResourceTransformer> transformers = new ArrayList<>(shadeRequest.getResourceTransformers());
+        ManifestResourceTransformer manifestTransformer = null;
+        for (Iterator<ResourceTransformer> it = transformers.iterator(); it.hasNext(); ) {
+            ResourceTransformer transformer = it.next();
+            if (transformer instanceof ManifestResourceTransformer) {
+                manifestTransformer = (ManifestResourceTransformer) transformer;
+                it.remove();
+            }
+        }
+
+        PlanContext context = new PlanContext(
+                plan,
+                transformers,
+                new DefaultPackageMapper(shadeRequest.getRelocators()),
+                shadeRequest.isShadeSourcesContent());
+
+        try {
+            if (manifestTransformer != null) {
+                for (File jar : jars) {
+                    planManifestEntry(context, jar, manifestTransformer);
+                }
+            }
+
+            for (File jar : jars) {
+                List<Filter> jarFilters = getFilters(jar, shadeRequest.getFilters());
+                if (jar.isDirectory()) {
+                    planDirectory(context, jar, jar, "", jarFilters);
+                } else {
+                    planJar(context, jar, jarFilters);
+                }
+            }
+        } catch (PlanFailureException failure) {
+            return plan.incomplete(failure.jar, failure.entry, failure.getMessage())
+                    .build();
+        }
+
+        return plan.build();
+    }
+
+    /**
+     * Aborts a dry-run plan, carrying the location of the entry that could not be planned.
+     */
+    private static final class PlanFailureException extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        private final String jar;
+
+        private final String entry;
+
+        PlanFailureException(String jar, String entry, Throwable cause) {
+            super(String.valueOf(cause), cause);
+            this.jar = jar;
+            this.entry = entry;
+        }
+    }
+
+    /**
+     * State of a dry-run walk over the input JARs. Mirrors the bookkeeping of a real shading run
+     * ({@code resources} and the written class entries) so that the plan reaches the same decisions
+     * without writing anything.
+     */
+    private static final class PlanContext {
+        private final ShadePlan.Builder plan;
+
+        private final List<ResourceTransformer> transformers;
+
+        private final DefaultPackageMapper packageMapper;
+
+        private final boolean shadeSourcesContent;
+
+        private final Set<String> resources = new HashSet<>();
+
+        private final Set<String> writtenClasses = new HashSet<>();
+
+        private final Set<String> manifestConsumed = new HashSet<>();
+
+        PlanContext(
+                ShadePlan.Builder plan,
+                List<ResourceTransformer> transformers,
+                DefaultPackageMapper packageMapper,
+                boolean shadeSourcesContent) {
+            this.plan = plan;
+            this.transformers = transformers;
+            this.packageMapper = packageMapper;
+            this.shadeSourcesContent = shadeSourcesContent;
+        }
+    }
+
+    private void planManifestEntry(PlanContext context, File jar, ManifestResourceTransformer manifestTransformer)
+            throws PlanFailureException {
+        try (JarFile jarFile = newJarFile(jar)) {
+            for (Enumeration<JarEntry> en = jarFile.entries(); en.hasMoreElements(); ) {
+                JarEntry entry = en.nextElement();
+                String resource = entry.getName();
+                if (manifestTransformer.canTransformResource(resource)) {
+                    context.resources.add(resource);
+                    context.manifestConsumed.add(jar.getPath() + '\0' + resource);
+                    ShadePlanEntry.Builder builder = new ShadePlanEntry.Builder(
+                                    jar.getPath(),
+                                    resource,
+                                    classifyEntry(resource, false),
+                                    ShadePlanEntry.Outcome.TRANSFORMED)
+                            .transformer(manifestTransformer.getClass().getName())
+                            .finalPath(resource);
+                    try {
+                        manifestTransformer.contributeToPlan(builder);
+                    } catch (RuntimeException e) {
+                        throw new PlanFailureException(jar.getPath(), resource, e);
+                    }
+                    context.plan.addEntry(builder.build());
+                    break;
+                }
+            }
+        } catch (IOException e) {
+            throw new PlanFailureException(jar.getPath(), null, e);
+        }
+    }
+
+    private void planJar(PlanContext context, File jar, List<Filter> jarFilters) throws PlanFailureException {
+        final JarFile jarFile;
+        try {
+            jarFile = newJarFile(jar);
+        } catch (IOException e) {
+            throw new PlanFailureException(jar.getPath(), null, e);
+        }
+        try (JarFile ignored = jarFile) {
+            for (Enumeration<JarEntry> j = jarFile.entries(); j.hasMoreElements(); ) {
+                final JarEntry entry = j.nextElement();
+                final String name = entry.getName();
+                try {
+                    planEntry(
+                            context,
+                            jar,
+                            jarFilters,
+                            new Callable<InputStream>() {
+                                @Override
+                                public InputStream call() throws Exception {
+                                    return jarFile.getInputStream(entry);
+                                }
+                            },
+                            name,
+                            getTime(entry),
+                            entry.getMethod(),
+                            entry.isDirectory());
+                } catch (PlanFailureException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new PlanFailureException(jar.getPath(), name, e);
+                }
+            }
+        } catch (IOException e) {
+            throw new PlanFailureException(jar.getPath(), null, e);
+        }
+    }
+
+    private void planDirectory(PlanContext context, File jar, File current, String prefix, List<Filter> jarFilters)
+            throws PlanFailureException {
+        final File[] children = current.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (final File file : children) {
+            final String name = prefix + file.getName();
+            if (file.isDirectory()) {
+                planDirectory(context, jar, file, name + '/', jarFilters);
+                continue;
+            }
+            try {
+                planEntry(
+                        context,
+                        jar,
+                        jarFilters,
+                        new Callable<InputStream>() {
+                            @Override
+                            public InputStream call() throws Exception {
+                                return Files.newInputStream(file.toPath());
+                            }
+                        },
+                        name,
+                        file.lastModified(),
+                        -1 /*ignore*/,
+                        false);
+            } catch (PlanFailureException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new PlanFailureException(jar.getPath(), name, e);
+            }
+        }
+    }
+
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private void planEntry(
+            PlanContext context,
+            File jar,
+            List<Filter> jarFilters,
+            Callable<InputStream> inputProvider,
+            String name,
+            long time,
+            int method,
+            boolean directory)
+            throws Exception {
+        final String jarPath = jar.getPath();
+
+        if (directory) {
+            // directory entries of input JARs are not copied; directories are synthesized on demand
+            context.plan.addEntry(new ShadePlanEntry.Builder(
+                            jarPath, name, ShadePlanEntry.Kind.DIRECTORY, ShadePlanEntry.Outcome.SKIPPED)
+                    .build());
+            return;
+        }
+
+        Filter filter = selectFilter(jarFilters, name);
+        if (filter != null) {
+            context.plan.addEntry(new ShadePlanEntry.Builder(
+                            jarPath, name, classifyEntry(name, false), ShadePlanEntry.Outcome.FILTERED)
+                    .filter(filter.getClass().getName())
+                    .build());
+            return;
+        }
+
+        String excluded = excludedEntryReason(name);
+        if (excluded != null) {
+            context.plan.addEntry(new ShadePlanEntry.Builder(
+                            jarPath, name, classifyEntry(name, false), ShadePlanEntry.Outcome.EXCLUDED)
+                    .excluded(excluded)
+                    .build());
+            return;
+        }
+
+        ShadePlanEntry.Kind kind = classifyEntry(name, false);
+        String mappedName = context.packageMapper.map(name, true, false);
+        String finalPath = finalPathOf(name, context.packageMapper);
+        String relocatedPath = finalPath.equals(name) ? null : finalPath;
+
+        int idx = mappedName.lastIndexOf('/');
+        if (idx != -1) {
+            // make sure dirs are created
+            String dir = mappedName.substring(0, idx);
+            if (!context.resources.contains(dir)) {
+                planDirectories(context, jarPath, dir, time);
+            }
+        }
+
+        if (context.manifestConsumed.contains(jarPath + '\0' + name)) {
+            // already recorded as consumed by the manifest transformer pre-pass
+            return;
+        }
+
+        if (kind == ShadePlanEntry.Kind.CLASS) {
+            boolean winner = context.writtenClasses.add(finalPath);
+            context.plan.addEntry(basePlanEntry(
+                            jarPath,
+                            name,
+                            kind,
+                            winner ? ShadePlanEntry.Outcome.WRITTEN : ShadePlanEntry.Outcome.DUPLICATE,
+                            finalPath,
+                            relocatedPath,
+                            time)
+                    .compression("DEFLATED")
+                    .build());
+        } else if (context.shadeSourcesContent && kind == ShadePlanEntry.Kind.JAVA_SOURCE) {
+            boolean duplicate = !context.resources.add(mappedName);
+            context.plan.addEntry(basePlanEntry(
+                            jarPath,
+                            name,
+                            kind,
+                            duplicate ? ShadePlanEntry.Outcome.DUPLICATE : ShadePlanEntry.Outcome.WRITTEN,
+                            mappedName,
+                            relocatedPath,
+                            time)
+                    .compression("DEFLATED")
+                    .build());
+        } else {
+            ResourceTransformer transformer = selectTransformer(context.transformers, mappedName);
+            if (transformer != null) {
+                ShadePlanEntry.Builder builder = basePlanEntry(
+                                jarPath,
+                                name,
+                                kind,
+                                ShadePlanEntry.Outcome.TRANSFORMED,
+                                mappedName,
+                                relocatedPath,
+                                time)
+                        .transformer(transformer.getClass().getName());
+                try {
+                    transformer.contributeToPlan(builder);
+                } catch (RuntimeException e) {
+                    throw new PlanFailureException(jarPath, name, e);
+                }
+                context.plan.addEntry(builder.build());
+            } else {
+                boolean duplicate = !context.resources.add(mappedName);
+                String compression = null;
+                if (!duplicate) {
+                    compression = "DEFLATED";
+                    if (method == ZipEntry.STORED) {
+                        // uncompressed nested jars must stay uncompressed, otherwise the JVM can't load them
+                        try (InputStream in = inputProvider.call()) {
+                            if (new ZipHeaderPeekInputStream(in).hasZipHeader()) {
+                                compression = "STORED";
+                            }
+                        }
+                    }
+                }
+                context.plan.addEntry(basePlanEntry(
+                                jarPath,
+                                name,
+                                kind,
+                                duplicate ? ShadePlanEntry.Outcome.DUPLICATE : ShadePlanEntry.Outcome.WRITTEN,
+                                mappedName,
+                                relocatedPath,
+                                time)
+                        .compression(compression)
+                        .build());
+            }
+        }
+    }
+
+    private void planDirectories(PlanContext context, String jarPath, String name, long time) {
+        if (name.lastIndexOf('/') > 0) {
+            String parent = name.substring(0, name.lastIndexOf('/'));
+            if (!context.resources.contains(parent)) {
+                planDirectories(context, jarPath, parent, time);
+            }
+        }
+
+        // directory entries are written with a trailing slash
+        context.resources.add(name);
+        context.plan.addEntry(basePlanEntry(
+                        jarPath,
+                        name + '/',
+                        ShadePlanEntry.Kind.DIRECTORY,
+                        ShadePlanEntry.Outcome.WRITTEN,
+                        name + '/',
+                        null,
+                        time)
+                .compression("DEFLATED")
+                .build());
+    }
+
+    private static ShadePlanEntry.Builder basePlanEntry(
+            String jarPath,
+            String name,
+            ShadePlanEntry.Kind kind,
+            ShadePlanEntry.Outcome outcome,
+            String finalPath,
+            String relocatedPath,
+            long time) {
+        ShadePlanEntry.Builder builder = new ShadePlanEntry.Builder(jarPath, name, kind, outcome)
+                .finalPath(finalPath)
+                .relocatedPath(relocatedPath)
+                .winner(outcome == ShadePlanEntry.Outcome.WRITTEN);
+        if (outcome == ShadePlanEntry.Outcome.WRITTEN) {
+            builder.timestampPolicy(time >= 0 ? "PRESERVE" : "UNSET").time(time);
+        }
+        return builder;
+    }
+
+    private static ShadePlanEntry.Kind classifyEntry(String name, boolean directory) {
+        if (directory) {
+            return ShadePlanEntry.Kind.DIRECTORY;
+        }
+        if ("META-INF/MANIFEST.MF".equalsIgnoreCase(name)) {
+            return ShadePlanEntry.Kind.MANIFEST;
+        }
+        if (name.startsWith("META-INF/services/")) {
+            return ShadePlanEntry.Kind.SERVICE;
+        }
+        if (name.startsWith("META-INF/versions/")) {
+            return ShadePlanEntry.Kind.MULTI_RELEASE;
+        }
+        if ("module-info.class".equals(name)) {
+            return ShadePlanEntry.Kind.MODULE_INFO;
+        }
+        if (isSignatureFile(name)) {
+            return ShadePlanEntry.Kind.SIGNATURE;
+        }
+        if (name.endsWith(".class")) {
+            return ShadePlanEntry.Kind.CLASS;
+        }
+        if (name.endsWith(".java")) {
+            return ShadePlanEntry.Kind.JAVA_SOURCE;
+        }
+        return ShadePlanEntry.Kind.RESOURCE;
+    }
+
+    private static boolean isSignatureFile(String name) {
+        if (!name.startsWith("META-INF/")) {
+            return false;
+        }
+        String simpleName = name.substring("META-INF/".length());
+        if (simpleName.indexOf('/') != -1) {
+            return false;
+        }
+        String upper = simpleName.toUpperCase(Locale.ENGLISH);
+        return upper.startsWith("SIG-")
+                || upper.endsWith(".SF")
+                || upper.endsWith(".RSA")
+                || upper.endsWith(".DSA")
+                || upper.endsWith(".EC");
     }
 
     /**
@@ -385,19 +796,23 @@ public class DefaultShader implements Shader {
         }
     }
 
-    private boolean isExcludedEntry(final String name) {
+    private String excludedEntryReason(final String name) {
         if ("META-INF/INDEX.LIST".equals(name)) {
             // we cannot allow the jar indexes to be copied over or the
             // jar is useless. Ideally, we could create a new one
             // later
-            return true;
+            return "JAR indexes cannot be copied to the uber JAR";
         }
 
         if ("module-info.class".equals(name)) {
             logger.warn("Discovered module-info.class. " + "Shading will break its strong encapsulation.");
-            return true;
+            return "module-info.class cannot be shaded without breaking its strong encapsulation";
         }
-        return false;
+        return null;
+    }
+
+    private boolean isExcludedEntry(final String name) {
+        return excludedEntryReason(name) != null;
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -638,12 +1053,10 @@ public class DefaultShader implements Shader {
             renamedClass = originalClass;
         }
 
-        // Need to take the .class off for remapping evaluation
-        String mappedName = packageMapper.map(name.substring(0, name.indexOf('.')), true, false);
+        String mappedName = finalPathOf(name, packageMapper);
 
         try {
-            // Now we put it back on so the class file is written out with the right extension.
-            JarEntry entry = new JarEntry(mappedName + ".class");
+            JarEntry entry = new JarEntry(mappedName);
             entry.setTime(time);
             jos.putNextEntry(entry);
 
@@ -654,13 +1067,16 @@ public class DefaultShader implements Shader {
     }
 
     private boolean isFiltered(List<Filter> filters, String name) {
+        return selectFilter(filters, name) != null;
+    }
+
+    private static Filter selectFilter(List<Filter> filters, String name) {
         for (Filter filter : filters) {
             if (filter.isFiltered(name)) {
-                return true;
+                return filter;
             }
         }
-
-        return false;
+        return null;
     }
 
     private boolean resourceTransformed(
@@ -670,25 +1086,42 @@ public class DefaultShader implements Shader {
             List<Relocator> relocators,
             long time)
             throws IOException {
-        boolean resourceTransformed = false;
+        ResourceTransformer selected = selectTransformer(resourceTransformers, name);
+        if (selected == null) {
+            return false;
+        }
 
+        logger.debug("Transforming " + name + " using " + selected.getClass().getName());
+
+        if (selected instanceof ReproducibleResourceTransformer) {
+            ((ReproducibleResourceTransformer) selected).processResource(name, is, relocators, time);
+        } else {
+            selected.processResource(name, is, relocators);
+        }
+        return true;
+    }
+
+    private static ResourceTransformer selectTransformer(List<ResourceTransformer> resourceTransformers, String name) {
         for (ResourceTransformer transformer : resourceTransformers) {
             if (transformer.canTransformResource(name)) {
-                logger.debug("Transforming " + name + " using "
-                        + transformer.getClass().getName());
-
-                if (transformer instanceof ReproducibleResourceTransformer) {
-                    ((ReproducibleResourceTransformer) transformer).processResource(name, is, relocators, time);
-                } else {
-                    transformer.processResource(name, is, relocators);
-                }
-
-                resourceTransformed = true;
-
-                break;
+                return transformer;
             }
         }
-        return resourceTransformed;
+        return null;
+    }
+
+    /**
+     * Computes the path the given entry would have in the output JAR, taking relocations into account.
+     * This is the single place where the final path of an entry is decided, shared by the real shading
+     * and the dry-run plan.
+     */
+    private static String finalPathOf(String name, DefaultPackageMapper packageMapper) {
+        if (name.endsWith(".class")) {
+            // Need to take the .class off for remapping evaluation, then put it back on so the class
+            // file is written out with the right extension.
+            return packageMapper.map(name.substring(0, name.indexOf('.')), true, false) + ".class";
+        }
+        return packageMapper.map(name, true, false);
     }
 
     private void addJavaSource(

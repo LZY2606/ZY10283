@@ -34,4 +34,10 @@ public class MockShader implements Shader {
     public void shade(ShadeRequest shadeRequest) throws IOException, MojoExecutionException {
         System.out.println("Executing MockShader#shade");
     }
+
+    @Override
+    public ShadePlan plan(ShadeRequest shadeRequest) {
+        System.out.println("Executing MockShader#plan");
+        return ShadePlan.builder().build();
+    }
 }
