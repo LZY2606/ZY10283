@@ -21,6 +21,7 @@ package org.apache.maven.plugins.shade.resource;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -55,14 +56,7 @@ public class ServicesResourceTransformer extends AbstractCompatibilityTransforme
     @Override
     public void processResource(String resource, InputStream is, final List<Relocator> relocators, long time)
             throws IOException {
-        resource = resource.substring(SERVICES_PATH.length() + 1);
-        for (Relocator relocator : relocators) {
-            if (relocator.canRelocateClass(resource)) {
-                resource = relocator.relocateClass(resource);
-                break;
-            }
-        }
-        resource = SERVICES_PATH + '/' + resource;
+        resource = relocatedServiceName(resource, relocators);
 
         Set<String> out = serviceEntries.computeIfAbsent(resource, k -> new LinkedHashSet<>());
 
@@ -80,6 +74,22 @@ public class ServicesResourceTransformer extends AbstractCompatibilityTransforme
         if (time > this.time) {
             this.time = time;
         }
+    }
+
+    private static String relocatedServiceName(String resource, List<Relocator> relocators) {
+        resource = resource.substring(SERVICES_PATH.length() + 1);
+        for (Relocator relocator : relocators) {
+            if (relocator.canRelocateClass(resource)) {
+                resource = relocator.relocateClass(resource);
+                break;
+            }
+        }
+        return SERVICES_PATH + '/' + resource;
+    }
+
+    @Override
+    public Map<String, String> describePlanContribution(String resource, List<Relocator> relocators) {
+        return Collections.singletonMap("output", relocatedServiceName(resource, relocators));
     }
 
     @Override

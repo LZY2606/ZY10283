@@ -45,6 +45,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -187,6 +188,438 @@ public class DefaultShader implements Shader {
         for (Filter filter : shadeRequest.getFilters()) {
             filter.finished();
         }
+    }
+
+    /**
+     * Computes the plan of a shading operation without writing the output JAR and without letting
+     * resource transformers finish (or otherwise mutate) the output. Every decision is taken by the
+     * same code paths as {@link #shade(ShadeRequest)}; resource transformers are only asked for
+     * their read-only {@link ResourceTransformer#describePlanContribution plan contribution}, so a
+     * subsequent real shading with the same transformer instances is not polluted by the dry-run.
+     * <p>
+     * If an entry cannot be processed (for example an illegal class file) or a transformer fails to
+     * describe its contribution, an incomplete plan is returned whose failure points at the input
+     * artifact and entry where planning stopped.
+     */
+    @Override
+    public ShadePlan shadePlan(ShadeRequest shadeRequest) {
+        ShadePlan.Builder plan = ShadePlan.builder();
+
+        ManifestResourceTransformer manifestTransformer = null;
+        List<ResourceTransformer> transformers = new ArrayList<>(shadeRequest.getResourceTransformers());
+        for (Iterator<ResourceTransformer> it = transformers.iterator(); it.hasNext(); ) {
+            ResourceTransformer transformer = it.next();
+            if (transformer instanceof ManifestResourceTransformer) {
+                manifestTransformer = (ManifestResourceTransformer) transformer;
+                it.remove();
+            }
+        }
+
+        PlanSession session = new PlanSession(shadeRequest, plan, transformers, manifestTransformer);
+        try {
+            session.planAll();
+        } catch (PlanFailure failure) {
+            plan.incomplete(failure.jar, failure.entry, failure.getMessage());
+        }
+        return plan.build();
+    }
+
+    /**
+     * Signals that planning cannot continue; carries the location of the failure.
+     */
+    private static final class PlanFailure extends Exception {
+        private final String jar;
+
+        private final String entry;
+
+        PlanFailure(String jar, String entry, String message) {
+            super(message);
+            this.jar = jar;
+            this.entry = entry;
+        }
+    }
+
+    /**
+     * State of a single dry-run planning pass. Mirrors {@link #shade(ShadeRequest)} decision for
+     * decision, but records them instead of writing the output JAR.
+     */
+    private final class PlanSession {
+        private final ShadeRequest shadeRequest;
+
+        private final ShadePlan.Builder plan;
+
+        private final List<ResourceTransformer> transformers;
+
+        private final ManifestResourceTransformer manifestTransformer;
+
+        private final DefaultPackageMapper packageMapper;
+
+        /** Mirrors {@code resources} of the real shading: directories and written resources. */
+        private final Set<String> resources = new HashSet<>();
+
+        /** Every output entry name claimed so far, including class files. */
+        private final Set<String> written = new HashSet<>();
+
+        /** Entries already recorded by the manifest transformer pre-pass. */
+        private final Set<String> manifestConsumed = new HashSet<>();
+
+        PlanSession(
+                ShadeRequest shadeRequest,
+                ShadePlan.Builder plan,
+                List<ResourceTransformer> transformers,
+                ManifestResourceTransformer manifestTransformer) {
+            this.shadeRequest = shadeRequest;
+            this.plan = plan;
+            this.transformers = transformers;
+            this.manifestTransformer = manifestTransformer;
+            this.packageMapper = new DefaultPackageMapper(shadeRequest.getRelocators());
+        }
+
+        void planAll() throws PlanFailure {
+            if (manifestTransformer != null) {
+                planManifestTransformer();
+            }
+            for (File jar : shadeRequest.getJars()) {
+                planJar(jar);
+            }
+        }
+
+        private void planManifestTransformer() throws PlanFailure {
+            boolean found = false;
+            for (File jar : shadeRequest.getJars()) {
+                try (JarFile jarFile = newJarFile(jar)) {
+                    for (Enumeration<JarEntry> en = jarFile.entries(); en.hasMoreElements(); ) {
+                        JarEntry entry = en.nextElement();
+                        String resource = entry.getName();
+                        if (manifestTransformer.canTransformResource(resource)) {
+                            found = true;
+                            resources.add(resource);
+                            written.add(resource);
+                            manifestConsumed.add(key(jar, resource));
+                            plan.addEntry(ShadePlanEntry.builder(jar.getPath(), resource, ShadePlanEntry.Kind.MANIFEST)
+                                    .disposition(ShadePlanEntry.Disposition.TRANSFORMED)
+                                    .output(JarFile.MANIFEST_NAME)
+                                    .transformer(manifestTransformer.getClass().getName())
+                                    .transformerDetail(planContribution(manifestTransformer, jar, resource, resource))
+                                    .compression(ShadePlanEntry.Compression.TRANSFORMER_DEFINED)
+                                    .timestampPolicy(ShadePlanEntry.TimestampPolicy.TRANSFORMER_DEFINED)
+                                    .build());
+                            break;
+                        }
+                    }
+                } catch (IOException e) {
+                    throw new PlanFailure(jar.getPath(), null, e.toString());
+                }
+            }
+            if (found || manifestTransformer.hasTransformedResource()) {
+                plan.addTransformerOutput(JarFile.MANIFEST_NAME);
+            }
+        }
+
+        private void planJar(File jar) throws PlanFailure {
+            plan.addJar(jar.getPath());
+
+            logger.debug("Processing JAR " + jar);
+
+            List<Filter> jarFilters = getFilters(jar, shadeRequest.getFilters());
+            if (jar.isDirectory()) {
+                planDir(jar, jar, "", jarFilters);
+                return;
+            }
+            try (JarFile jarFile = newJarFile(jar)) {
+                for (Enumeration<JarEntry> j = jarFile.entries(); j.hasMoreElements(); ) {
+                    final JarEntry entry = j.nextElement();
+                    final String name = entry.getName();
+                    try {
+                        planEntry(
+                                jar,
+                                new Callable<InputStream>() {
+                                    @Override
+                                    public InputStream call() throws Exception {
+                                        return jarFile.getInputStream(entry);
+                                    }
+                                },
+                                name,
+                                entry.getMethod(),
+                                jarFilters);
+                    } catch (PlanFailure failure) {
+                        throw failure;
+                    } catch (Exception e) {
+                        throw new PlanFailure(jar.getPath(), name, e.toString());
+                    }
+                }
+            } catch (IOException e) {
+                throw new PlanFailure(jar.getPath(), null, e.toString());
+            }
+        }
+
+        private void planDir(File jar, File current, String prefix, List<Filter> jarFilters) throws PlanFailure {
+            final File[] children = current.listFiles();
+            if (children == null) {
+                return;
+            }
+            for (final File file : children) {
+                final String name = prefix + file.getName();
+                if (file.isDirectory()) {
+                    planDir(jar, file, prefix + file.getName() + '/', jarFilters);
+                    continue;
+                }
+                try {
+                    planEntry(
+                            jar,
+                            new Callable<InputStream>() {
+                                @Override
+                                public InputStream call() throws Exception {
+                                    return Files.newInputStream(file.toPath());
+                                }
+                            },
+                            name,
+                            -1 /* ignore, like the real shading */,
+                            jarFilters);
+                } catch (PlanFailure failure) {
+                    throw failure;
+                } catch (Exception e) {
+                    throw new PlanFailure(jar.getPath(), name, e.toString());
+                }
+            }
+        }
+
+        @SuppressWarnings("checkstyle:ParameterNumber")
+        private void planEntry(
+                File jar, Callable<InputStream> inputProvider, String name, int method, List<Filter> jarFilters)
+                throws Exception {
+            final String jarPath = jar.getPath();
+            final ShadePlanEntry.Kind kind = classify(name);
+
+            if (name.endsWith("/")) {
+                // directory entries are not copied; directories are synthesized on demand
+                plan.addEntry(ShadePlanEntry.builder(jarPath, name, kind)
+                        .disposition(ShadePlanEntry.Disposition.SKIPPED)
+                        .build());
+                return;
+            }
+
+            Filter matchingFilter = findMatchingFilter(jarFilters, name);
+            if (matchingFilter != null) {
+                plan.addEntry(ShadePlanEntry.builder(jarPath, name, kind)
+                        .disposition(ShadePlanEntry.Disposition.FILTERED)
+                        .filteredBy(matchingFilter.getClass().getName())
+                        .build());
+                return;
+            }
+
+            String excludedReason = excludedReason(name);
+            if (excludedReason != null) {
+                plan.addEntry(ShadePlanEntry.builder(jarPath, name, kind)
+                        .disposition(ShadePlanEntry.Disposition.EXCLUDED)
+                        .excludedReason(excludedReason)
+                        .build());
+                return;
+            }
+
+            if (manifestConsumed.contains(key(jar, name))) {
+                // already recorded by the manifest transformer pre-pass
+                return;
+            }
+
+            String mappedName = packageMapper.map(name, true, false);
+
+            int idx = mappedName.lastIndexOf('/');
+            if (idx != -1) {
+                // make sure dirs are created
+                String dir = mappedName.substring(0, idx);
+                if (!resources.contains(dir)) {
+                    addPlannedDirectory(dir);
+                }
+            }
+
+            if (name.endsWith(".class")) {
+                planClassEntry(jar, inputProvider, name, kind);
+            } else if (shadeRequest.isShadeSourcesContent() && name.endsWith(".java")) {
+                if (resources.contains(mappedName)) {
+                    plan.addEntry(duplicate(jarPath, name, kind, mappedName));
+                } else {
+                    resources.add(mappedName);
+                    written.add(mappedName);
+                    plan.addEntry(written(jarPath, name, kind, mappedName, ShadePlanEntry.Compression.DEFLATED));
+                }
+            } else {
+                planResourceEntry(jar, inputProvider, name, kind, mappedName, method);
+            }
+        }
+
+        private void planClassEntry(
+                File jar, Callable<InputStream> inputProvider, String name, ShadePlanEntry.Kind kind) throws Exception {
+            // Need to take the .class off for remapping evaluation
+            String mappedName = packageMapper.map(name.substring(0, name.indexOf('.')), true, false) + ".class";
+            if (!packageMapper.relocators.isEmpty()) {
+                // share the ASM decision making with the real shading and surface illegal classes
+                byte[] originalClass;
+                try (InputStream in = inputProvider.call()) {
+                    originalClass = IOUtil.toByteArray(in);
+                }
+                remapClass(name, originalClass, packageMapper);
+            }
+            if (written.contains(mappedName)) {
+                plan.addEntry(duplicate(jar.getPath(), name, kind, mappedName));
+            } else {
+                written.add(mappedName);
+                plan.addEntry(written(jar.getPath(), name, kind, mappedName, ShadePlanEntry.Compression.DEFLATED));
+            }
+        }
+
+        private void planResourceEntry(
+                File jar,
+                Callable<InputStream> inputProvider,
+                String name,
+                ShadePlanEntry.Kind kind,
+                String mappedName,
+                int method)
+                throws Exception {
+            ResourceTransformer transformer = selectTransformer(transformers, mappedName);
+            if (transformer != null) {
+                Map<String, String> detail = planContribution(transformer, jar, name, mappedName);
+                String transformerOutput = detail.get("output");
+                if (transformerOutput != null) {
+                    plan.addTransformerOutput(transformerOutput);
+                }
+                plan.addEntry(ShadePlanEntry.builder(jar.getPath(), name, kind)
+                        .disposition(ShadePlanEntry.Disposition.TRANSFORMED)
+                        .output(mappedName)
+                        .transformer(transformer.getClass().getName())
+                        .transformerDetail(detail)
+                        .compression(ShadePlanEntry.Compression.TRANSFORMER_DEFINED)
+                        .timestampPolicy(ShadePlanEntry.TimestampPolicy.TRANSFORMER_DEFINED)
+                        .build());
+                return;
+            }
+            if (resources.contains(mappedName)) {
+                plan.addEntry(duplicate(jar.getPath(), name, kind, mappedName));
+                return;
+            }
+            if (written.contains(mappedName)) {
+                // a class file claimed this name before: the real shading fails writing the entry
+                throw new PlanFailure(jar.getPath(), name, "duplicate entry: " + mappedName);
+            }
+            ShadePlanEntry.Compression compression = plannedCompression(inputProvider, method);
+            resources.add(mappedName);
+            written.add(mappedName);
+            plan.addEntry(written(jar.getPath(), name, kind, mappedName, compression));
+        }
+
+        private ShadePlanEntry.Compression plannedCompression(Callable<InputStream> inputProvider, int method)
+                throws Exception {
+            // mirror addResource: uncompressed nested archives must stay STORED
+            if (method == ZipEntry.STORED) {
+                ZipHeaderPeekInputStream inputStream = new ZipHeaderPeekInputStream(inputProvider.call());
+                try {
+                    if (inputStream.hasZipHeader()) {
+                        return ShadePlanEntry.Compression.STORED;
+                    }
+                } finally {
+                    inputStream.close();
+                }
+            }
+            return ShadePlanEntry.Compression.DEFLATED;
+        }
+
+        private Map<String, String> planContribution(
+                ResourceTransformer transformer, File jar, String entry, String mappedName) throws PlanFailure {
+            try {
+                Map<String, String> detail =
+                        transformer.describePlanContribution(mappedName, shadeRequest.getRelocators());
+                return detail == null ? Collections.<String, String>emptyMap() : detail;
+            } catch (RuntimeException e) {
+                throw new PlanFailure(
+                        jar.getPath(),
+                        entry,
+                        "transformer " + transformer.getClass().getName()
+                                + " failed to describe its plan contribution: " + e);
+            }
+        }
+
+        private void addPlannedDirectory(String name) {
+            if (name.lastIndexOf('/') > 0) {
+                String parent = name.substring(0, name.lastIndexOf('/'));
+                if (!resources.contains(parent)) {
+                    addPlannedDirectory(parent);
+                }
+            }
+
+            // directory entries must end in "/"
+            resources.add(name);
+            written.add(name + '/');
+            plan.addOutputDirectory(name + '/');
+        }
+
+        private ShadePlanEntry written(
+                String jar,
+                String source,
+                ShadePlanEntry.Kind kind,
+                String output,
+                ShadePlanEntry.Compression compression) {
+            return ShadePlanEntry.builder(jar, source, kind)
+                    .disposition(ShadePlanEntry.Disposition.WRITTEN)
+                    .output(output)
+                    .compression(compression)
+                    .timestampPolicy(ShadePlanEntry.TimestampPolicy.SOURCE_ENTRY_TIME)
+                    .build();
+        }
+
+        private ShadePlanEntry duplicate(String jar, String source, ShadePlanEntry.Kind kind, String output) {
+            return ShadePlanEntry.builder(jar, source, kind)
+                    .disposition(ShadePlanEntry.Disposition.DUPLICATE)
+                    .output(output)
+                    .build();
+        }
+
+        private String key(File jar, String name) {
+            return jar.getPath() + '\0' + name;
+        }
+    }
+
+    private static ShadePlanEntry.Kind classify(String name) {
+        if (name.endsWith("/")) {
+            return ShadePlanEntry.Kind.DIRECTORY;
+        }
+        if (JarFile.MANIFEST_NAME.equalsIgnoreCase(name)) {
+            return ShadePlanEntry.Kind.MANIFEST;
+        }
+        if (name.startsWith("META-INF/services/")) {
+            return ShadePlanEntry.Kind.SERVICE;
+        }
+        if (isSignatureFile(name)) {
+            return ShadePlanEntry.Kind.SIGNATURE;
+        }
+        if ("module-info.class".equals(name)
+                || (name.startsWith("META-INF/versions/") && name.endsWith("/module-info.class"))) {
+            return ShadePlanEntry.Kind.MODULE_INFO;
+        }
+        if (name.startsWith("META-INF/versions/")) {
+            return ShadePlanEntry.Kind.MULTI_RELEASE;
+        }
+        if (name.endsWith(".class")) {
+            return ShadePlanEntry.Kind.CLASS;
+        }
+        if (name.endsWith(".java")) {
+            return ShadePlanEntry.Kind.JAVA_SOURCE;
+        }
+        return ShadePlanEntry.Kind.RESOURCE;
+    }
+
+    private static boolean isSignatureFile(String name) {
+        if (!name.startsWith("META-INF/")) {
+            return false;
+        }
+        String fileName = name.substring("META-INF/".length());
+        if (fileName.indexOf('/') != -1) {
+            return false;
+        }
+        String upperCase = fileName.toUpperCase(Locale.ENGLISH);
+        return upperCase.endsWith(".SF")
+                || upperCase.endsWith(".RSA")
+                || upperCase.endsWith(".DSA")
+                || upperCase.endsWith(".EC");
     }
 
     /**
@@ -386,18 +819,25 @@ public class DefaultShader implements Shader {
     }
 
     private boolean isExcludedEntry(final String name) {
+        String reason = excludedReason(name);
+        if (reason != null && "module-info.class".equals(name)) {
+            logger.warn("Discovered module-info.class. " + "Shading will break its strong encapsulation.");
+        }
+        return reason != null;
+    }
+
+    private static String excludedReason(final String name) {
         if ("META-INF/INDEX.LIST".equals(name)) {
             // we cannot allow the jar indexes to be copied over or the
             // jar is useless. Ideally, we could create a new one
             // later
-            return true;
+            return "META-INF/INDEX.LIST is not copied to the uber JAR";
         }
 
         if ("module-info.class".equals(name)) {
-            logger.warn("Discovered module-info.class. " + "Shading will break its strong encapsulation.");
-            return true;
+            return "module-info.class is not copied to the uber JAR";
         }
-        return false;
+        return null;
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -610,6 +1050,25 @@ public class DefaultShader implements Shader {
         // stack map frames are slightly different.
         byte[] originalClass = IOUtil.toByteArray(is);
 
+        final byte[] renamedClass = remapClass(name, originalClass, packageMapper);
+
+        // Need to take the .class off for remapping evaluation
+        String mappedName = packageMapper.map(name.substring(0, name.indexOf('.')), true, false);
+
+        try {
+            // Now we put it back on so the class file is written out with the right extension.
+            JarEntry entry = new JarEntry(mappedName + ".class");
+            entry.setTime(time);
+            jos.putNextEntry(entry);
+
+            jos.write(renamedClass);
+        } catch (ZipException e) {
+            logger.debug("We have a duplicate " + mappedName + " in " + jar);
+        }
+    }
+
+    private byte[] remapClass(String name, byte[] originalClass, DefaultPackageMapper packageMapper)
+            throws IOException, MojoExecutionException {
         ClassReader cr = new ClassReader(new ByteArrayInputStream(originalClass));
 
         // We don't pass the ClassReader here. This forces the ClassWriter to rebuild the constant pool.
@@ -637,30 +1096,20 @@ public class DefaultShader implements Shader {
             logger.debug("Keeping original class bytecode: " + name);
             renamedClass = originalClass;
         }
-
-        // Need to take the .class off for remapping evaluation
-        String mappedName = packageMapper.map(name.substring(0, name.indexOf('.')), true, false);
-
-        try {
-            // Now we put it back on so the class file is written out with the right extension.
-            JarEntry entry = new JarEntry(mappedName + ".class");
-            entry.setTime(time);
-            jos.putNextEntry(entry);
-
-            jos.write(renamedClass);
-        } catch (ZipException e) {
-            logger.debug("We have a duplicate " + mappedName + " in " + jar);
-        }
+        return renamedClass;
     }
 
     private boolean isFiltered(List<Filter> filters, String name) {
+        return findMatchingFilter(filters, name) != null;
+    }
+
+    private static Filter findMatchingFilter(List<Filter> filters, String name) {
         for (Filter filter : filters) {
             if (filter.isFiltered(name)) {
-                return true;
+                return filter;
             }
         }
-
-        return false;
+        return null;
     }
 
     private boolean resourceTransformed(
@@ -670,25 +1119,29 @@ public class DefaultShader implements Shader {
             List<Relocator> relocators,
             long time)
             throws IOException {
-        boolean resourceTransformed = false;
+        ResourceTransformer transformer = selectTransformer(resourceTransformers, name);
+        if (transformer == null) {
+            return false;
+        }
 
+        logger.debug("Transforming " + name + " using " + transformer.getClass().getName());
+
+        if (transformer instanceof ReproducibleResourceTransformer) {
+            ((ReproducibleResourceTransformer) transformer).processResource(name, is, relocators, time);
+        } else {
+            transformer.processResource(name, is, relocators);
+        }
+
+        return true;
+    }
+
+    private static ResourceTransformer selectTransformer(List<ResourceTransformer> resourceTransformers, String name) {
         for (ResourceTransformer transformer : resourceTransformers) {
             if (transformer.canTransformResource(name)) {
-                logger.debug("Transforming " + name + " using "
-                        + transformer.getClass().getName());
-
-                if (transformer instanceof ReproducibleResourceTransformer) {
-                    ((ReproducibleResourceTransformer) transformer).processResource(name, is, relocators, time);
-                } else {
-                    transformer.processResource(name, is, relocators);
-                }
-
-                resourceTransformed = true;
-
-                break;
+                return transformer;
             }
         }
-        return resourceTransformed;
+        return null;
     }
 
     private void addJavaSource(

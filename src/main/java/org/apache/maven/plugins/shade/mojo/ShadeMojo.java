@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.Writer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -51,6 +52,8 @@ import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
+import org.apache.maven.plugins.shade.ShadePlan;
+import org.apache.maven.plugins.shade.ShadePlanJsonWriter;
 import org.apache.maven.plugins.shade.ShadeRequest;
 import org.apache.maven.plugins.shade.Shader;
 import org.apache.maven.plugins.shade.filter.Filter;
@@ -281,6 +284,26 @@ public class ShadeMojo extends AbstractMojo {
      */
     @Parameter(defaultValue = "false")
     private boolean useDependencyReducedPomInJar;
+
+    /**
+     * When {@code true}, no shaded JAR is written. Instead, the plugin computes the plan of the
+     * shading for the main shaded artifact - which entry of every input artifact is filtered,
+     * relocated, consumed by a transformer or dropped as a duplicate, and which entry wins every
+     * duplicate group - and writes it as JSON to {@link #shadePlanFile}. Resource transformers are
+     * only asked for their read-only plan contribution and never finish the output stream.
+     *
+     * @since 3.6.3
+     */
+    @Parameter(property = "shade.dryRun", defaultValue = "false")
+    private boolean dryRun;
+
+    /**
+     * The file the dry-run shade plan is written to when {@link #dryRun} is {@code true}.
+     *
+     * @since 3.6.3
+     */
+    @Parameter(property = "shade.planFile", defaultValue = "${project.build.directory}/shade-plan.json")
+    private File shadePlanFile;
 
     /**
      * When true, dependencies are kept in the pom but with scope 'provided'; when false, the dependency is removed.
@@ -557,6 +580,11 @@ public class ShadeMojo extends AbstractMojo {
             ShadeRequest shadeRequest =
                     shadeRequest("jar", artifacts, outputJar, filters, relocators, resourceTransformers);
 
+            if (dryRun) {
+                writeShadePlan(shadeRequest);
+                return;
+            }
+
             shader.shade(shadeRequest);
 
             if (createSourcesJar) {
@@ -710,6 +738,46 @@ public class ShadeMojo extends AbstractMojo {
         shadeRequest.setRelocators(relocators);
         shadeRequest.setResourceTransformers(toResourceTransformers(shade, resourceTransformers));
         return shadeRequest;
+    }
+
+    /**
+     * Computes the dry-run shade plan for the main shaded artifact and writes it as JSON to
+     * {@link #shadePlanFile}. No shaded JAR is created and resource transformers never finish the
+     * output stream.
+     *
+     * @param shadeRequest the request that would be shaded without {@link #dryRun}
+     * @throws MojoExecutionException if the shader cannot plan, the plan file cannot be written, or
+     *             the plan is incomplete
+     */
+    private void writeShadePlan(ShadeRequest shadeRequest) throws MojoExecutionException {
+        ShadePlan plan;
+        try {
+            plan = shader.shadePlan(shadeRequest);
+        } catch (UnsupportedOperationException e) {
+            throw new MojoExecutionException(
+                    "The configured Shader does not support dry-run planning: " + e.getMessage(), e);
+        }
+
+        try {
+            if (shadePlanFile.getParentFile() != null) {
+                Files.createDirectories(shadePlanFile.getParentFile().toPath());
+            }
+            try (Writer writer = Files.newBufferedWriter(shadePlanFile.toPath(), StandardCharsets.UTF_8)) {
+                ShadePlanJsonWriter.write(plan, writer);
+            }
+        } catch (IOException e) {
+            throw new MojoExecutionException("Failed to write shade plan to " + shadePlanFile, e);
+        }
+
+        if (plan.isComplete()) {
+            getLog().info("Shade plan written to " + shadePlanFile);
+        } else {
+            ShadePlan.Failure failure = plan.getFailure();
+            String location =
+                    failure.getEntry() != null ? failure.getJar() + " entry " + failure.getEntry() : failure.getJar();
+            getLog().warn("Incomplete shade plan written to " + shadePlanFile);
+            throw new MojoExecutionException("Shade plan failed at " + location + ": " + failure.getError());
+        }
     }
 
     private ShadeRequest createShadeSourcesRequest(

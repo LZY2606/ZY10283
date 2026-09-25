@@ -237,6 +237,8 @@
           <artifactId>apache-rat-plugin</artifactId>
           <configuration>
             <excludes combine.children="append">
+              <!-- Environment marker file, not part of the repository. -->
+              <exclude>.pwgsb-origin</exclude>
               <!-- Can't add license header otherwise the tests will fail. -->
               <exclude>src/it/mrm/repository/services-resource-transformer/*/META-INF/services/org.apache.maven.Shade</exclude>
               <exclude>src/it/mrm/repository/services-resource-transformer-with-reloc-includes-excludes/*/META-INF/services/org.apache.maven.shade</exclude>

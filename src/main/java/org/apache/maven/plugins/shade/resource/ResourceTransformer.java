@@ -20,7 +20,9 @@ package org.apache.maven.plugins.shade.resource;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.jar.JarOutputStream;
 
 import org.apache.maven.plugins.shade.relocation.Relocator;
@@ -45,4 +47,21 @@ public interface ResourceTransformer {
     boolean hasTransformedResource();
 
     void modifyOutputStream(JarOutputStream os) throws IOException;
+
+    /**
+     * Read-only contribution to a dry-run shade plan. Called instead of
+     * {@link #processResource(String, InputStream, List)} when the shader only computes the plan of
+     * the shading. Implementations must not mutate any state, so that a subsequent real shading with
+     * the same transformer instance is not affected. The returned detail is recorded in the plan
+     * entry; the key {@code "output"} is reserved for the path of the output entry this transformer
+     * will produce for the given resource when it finishes the output stream.
+     *
+     * @param resource the resource name after relocation
+     * @param relocators the relocators in effect
+     * @return detail describing what this transformer would do with the resource, never {@code null}
+     * @since 3.6.3
+     */
+    default Map<String, String> describePlanContribution(String resource, List<Relocator> relocators) {
+        return Collections.emptyMap();
+    }
 }

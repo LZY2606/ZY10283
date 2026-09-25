@@ -34,4 +34,17 @@ public interface Shader {
      * @throws MojoExecutionException for anything else that goes wrong
      */
     void shade(ShadeRequest shadeRequest) throws IOException, MojoExecutionException;
+
+    /**
+     * Compute the plan of a shading operation without writing the output JAR. The default
+     * implementation signals that the shader does not support dry-run planning.
+     *
+     * @param shadeRequest holds the many parameters to this method
+     * @return the plan, possibly incomplete if an entry or a transformer failed
+     * @throws UnsupportedOperationException if this shader cannot produce a plan
+     * @since 3.6.3
+     */
+    default ShadePlan shadePlan(ShadeRequest shadeRequest) {
+        throw new UnsupportedOperationException(getClass().getName() + " does not support dry-run shade planning");
+    }
 }
